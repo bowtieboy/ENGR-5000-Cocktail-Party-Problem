@@ -43,6 +43,9 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                 fullyConnectedLayer(12000)
                 tanhLayer
                 dropoutLayer
+                fullyConnectedLayer(12000)
+                tanhLayer
+                dropoutLayer
                 fullyConnectedLayer(obj.desired_fs / obj.window_size)
                 tanhLayer
                 regressionLayer];
