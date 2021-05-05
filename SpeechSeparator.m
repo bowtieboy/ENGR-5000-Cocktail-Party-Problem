@@ -37,18 +37,6 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                 assert(0, 'Can not find speech_filter.mat. Is it in this directory?');
             end
             
-            % Define the structure of each neural network
-            obj.network_layers = [
-                featureInputLayer(obj.desired_fs / obj.window_size)
-                fullyConnectedLayer(12000)
-                tanhLayer
-                dropoutLayer
-                fullyConnectedLayer(12000)
-                tanhLayer
-                dropoutLayer
-                fullyConnectedLayer(obj.desired_fs / obj.window_size)
-                tanhLayer
-                regressionLayer];
         end
         
         % Audio vectors is a list of the audio vectors said by the speaker,
@@ -101,6 +89,11 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             % Parition the data into training and test sets
             partitionData(obj);
             
+        end
+        
+        % Begin training the neural networks if enough users exist in the
+        % system
+        function trainNetworks(obj)
             % Check if the training and testing datasets exist, and if so
             % begin training the neural networks
             if (obj.dataset_size == 0)
@@ -108,16 +101,88 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                 return;
             end
             
+            % Define the structure of each neural network
+            numNodes = 4000;
+            obj.network_layers = [
+                
+                featureInputLayer((obj.desired_fs / obj.window_size))
+                
+                fullyConnectedLayer(numNodes)
+                tanhLayer
+                batchNormalizationLayer
+                dropoutLayer(0.75)
+                
+                fullyConnectedLayer(numNodes)
+                tanhLayer
+                batchNormalizationLayer
+                dropoutLayer(0.75)
+                
+                fullyConnectedLayer((obj.desired_fs / obj.window_size))
+                tanhLayer
+                
+                regressionLayer];
+            
+            % Train the networks with the given parameters
             disp('Training the network(s).');
+            % Delete the previous filter masks
+            obj.filter_masks = struct();
             for s = 1 : obj.dataset_size
-                training_options = trainingOptions('adam', 'Plots',...
-                    'training-progress', 'ValidationData',...
-                    obj.testing_data(s).validation_data,...
-                    'MiniBatchSize', 1024, 'Shuffle', 'every-epoch',...
-                    'ExecutionEnvironment', 'cpu', 'GradientThreshold', 100,...
-                    'MaxEpochs', 100, 'ValidationFrequency', 10);
+                
+                training_options = trainingOptions('adam',...
+                    'Plots', 'training-progress',...
+                    'MiniBatchSize', 64,...
+                    'Shuffle', 'every-epoch',...
+                    'ExecutionEnvironment', 'cpu',...
+                    'MaxEpochs', 20,...
+                    'ValidationData', obj.testing_data(s).validation_data,...
+                    'ValidationFrequency', 50,...
+                    'GradientThreshold', 1,...
+                    'InitialLearnRate',0.001,...
+                    'LearnRateSchedule','piecewise',...
+                    'LearnRateDropPeriod',1,...
+                    'LearnRateDropFactor',0.5);
                 current_net = trainNetwork(obj.training_data(s).data, obj.network_layers, training_options);
                 obj.filter_masks(s).net = current_net;
+                obj.filter_masks(s).speaker = obj.training_data(s).name;
+            end
+        end
+        
+        function separated_audio = separateSpeech(obj, audio, fs, known_speaker)
+            
+            % Determine which model to use based on the speaker
+            for s = 1 : length(obj.filter_masks)
+                
+                % Use the NN for the speaker
+                if (strcmp(known_speaker, obj.filter_masks(s).speaker))
+                    net = obj.filter_masks(s).net;
+                    break
+                end
+                
+            end
+            
+            % If the speaker is not in the system, return
+            if (~(exist('net', 'var')))
+                disp([known_speaker, ' has not been added to the system yet, and therefore has no trained model for speech separation.']);
+                return
+            end
+            
+            % Pre-process the audio vector
+            [processed_audio, new_fs] = preProcessAudio(obj, audio, fs);
+            
+            % Prepare the data to be run through the network by creating
+            % windows and calculating FFTs
+            windows = makeAudioWindows(obj, processed_audio, new_fs);
+            fft_windows = zeros(length(windows(:, 1)), length(windows(1, :)));
+            output_windows = fft_windows;
+            for w = 1 : length(windows(:, 1))
+                temp_fft = fft(windows(w, :));
+                temp_fft = temp_fft(1 : floor(length(temp_fft) / 2));
+                fft_windows(w, :) = temp_fft;
+            end
+            
+            % Run the ffts through the network
+            for w = 1 : length(fft_windows(:, 1))
+                output_windows(w, :) = ifft(net.predict(fft_windows(w, :)));
             end
             
         end
@@ -142,12 +207,12 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             if (~(length(audio(:, 1)) == 1))
                 audio = audio.';
             end
-            
-            % Normalize audio
-            audio = (audio - min(audio)) ./ (max(audio) - min(audio));
                         
             % Apply bandpass filter
-            data = obj.bandpass_filter.filter(audio);
+            audio = obj.bandpass_filter.filter(audio);
+            
+            % Normalize audio
+            data = audio / max(audio);
             
             % Cut out silences
             speechIdx = detectSpeech(data.', fs);
@@ -228,7 +293,7 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             
             % Ensure there are at least two speakers in the dataset
             if (obj.speech_data_size < 2)
-                disp('Need more than 1 speaker to begin training the model.');
+                disp('Need more than 1 speaker to begin creating datasets.');
                 return;
             end
             
@@ -239,9 +304,10 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             % will grow factorially, so be wary of adding many speakers to
             % the system.
             
-            % Step 1) Erase previous data
+            % Erase previous data
             obj.training_data = struct();
             obj.testing_data = struct();
+            obj.dataset_size = 0;
             
             % Get the original speaker whose speech the other windows will
             % be added to
@@ -249,13 +315,16 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                 
                 % Simplifies variable calls
                 new_speaker_data = obj.speech_data(new_speaker);
+                
+                % Print what speaker is being calculated
+                disp(['Calculating and partitioning data for ', new_speaker_data.name]);
 
                 % Calculate the index on where to cutoff the training and
                 % testing datasets
                 training_index_cutoff = floor(length(new_speaker_data.windows(:, 1)) * obj.training_percentage);
                 testing_index_cutoff = training_index_cutoff + 1;
 
-                % Create the vectors that will be used for making both training
+                % Create the matrices that will be used for making both training
                 % and testing data sets
                 new_training_data = new_speaker_data(1).windows(1 : training_index_cutoff, :);
                 new_testing_data = new_speaker_data(1).windows(testing_index_cutoff : end - 1, :);
@@ -274,11 +343,12 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                         continue;
                     end
                     
+                    % Determine how many rows the matrices will have
                     training_overlapping_windows_amount = training_overlapping_windows_amount + (training_data_windows_amount * length(obj.speech_data(other_speaker).windows(:, 1)));
                     testing_overlapping_windows_amount = testing_overlapping_windows_amount + (testing_data_windows_amount * length(obj.speech_data(other_speaker).windows(:, 1)));
                 end
-                new_training_input = zeros(training_overlapping_windows_amount, new_speaker_data.fs / obj.window_size);
-                new_testing_input = zeros(testing_overlapping_windows_amount, new_speaker_data.fs / obj.window_size);
+                new_training_input = zeros(training_overlapping_windows_amount, (obj.desired_fs / obj.window_size));
+                new_testing_input = zeros(testing_overlapping_windows_amount, (obj.desired_fs / obj.window_size));
                 new_training_output = new_training_input;
                 new_testing_output = new_testing_input;
                 % Loop through the data AGAIN and use the speech from the
@@ -294,20 +364,32 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                     end
                     
                     % Grab the windows from the speaker
-                    other_speaker_speech = obj.speech_data(other_speaker).windows;
+                    other_speaker_speech = obj.speech_data(other_speaker).windows;                    
                     
                     % Loop through the current speakers windows
                     for cs = 1 : training_data_windows_amount
                         
                         % Loop through the other speakers windows
-                        for os = 1 : length(other_speaker_speech(:, 1))
-                            
+                        for os = 1 : length(other_speaker_speech(:, 1))                                                        
                             % Add the speech together
                             overlapping_vector = other_speaker_speech(os, :) + new_training_data(cs, :);
-                            % Insert the vector into the matrix
-                            new_training_input(current_training_idx, :) = overlapping_vector;
-                            % Assign the output to be the original vector
-                            new_training_output(current_training_idx, :) = new_training_data(cs, :);
+                            % Compute the FFT for each of the speech vectors
+                            target_speaker_fft = fft(new_training_data(cs, :));
+                            mixed_speaker_fft = fft(overlapping_vector);
+                            % Cut out the latter half of the vector since
+                            % its an even func
+                            target_speaker_fft = target_speaker_fft(1 : floor(length(target_speaker_fft) / 2));
+                            mixed_speaker_fft = mixed_speaker_fft(1 : floor(length(mixed_speaker_fft) / 2));
+                            % Separate out the real and imaginary parts of
+                            % the fft and use them as separate inputs
+                            target_speaker_fft = [real(target_speaker_fft); imag(target_speaker_fft)];
+                            target_speaker_fft = target_speaker_fft(:)';
+                            mixed_speaker_fft = [real(mixed_speaker_fft); imag(mixed_speaker_fft)];
+                            mixed_speaker_fft = mixed_speaker_fft(:)';
+                            % Assign the input as the zscores of the data
+                            new_training_input(current_training_idx, :) = zscore(mixed_speaker_fft);
+                            % Assign the output as the zscores of the data
+                            new_training_output(current_training_idx, :) = zscore(target_speaker_fft);
                             % Iterate idx
                             current_training_idx = current_training_idx + 1;
                         end
@@ -321,10 +403,23 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                             
                             % Add the speech together
                             overlapping_vector = other_speaker_speech(os, :) + new_testing_data(cs, :);
-                            % Insert the vector into the matrix
-                            new_testing_input(current_testing_idx, :) = overlapping_vector;
-                            % Assign the output to be the original vector
-                            new_testing_output(current_testing_idx, :) = new_testing_data(cs, :);
+                            % Compute the FFT for each of the speech vectors
+                            target_speaker_fft = fft(new_testing_data(cs, :));
+                            mixed_speaker_fft = fft(overlapping_vector);
+                            % Cut out the latter half of the vector since
+                            % its an even func
+                            target_speaker_fft = target_speaker_fft(1 : floor(length(target_speaker_fft) / 2));
+                            mixed_speaker_fft = mixed_speaker_fft(1 : floor(length(mixed_speaker_fft) / 2));
+                            % Separate out the real and imaginary parts of
+                            % the fft and use them as separate inputs
+                            target_speaker_fft = [real(target_speaker_fft); imag(target_speaker_fft)];
+                            target_speaker_fft = target_speaker_fft(:)';
+                            mixed_speaker_fft = [real(mixed_speaker_fft); imag(mixed_speaker_fft)];
+                            mixed_speaker_fft = mixed_speaker_fft(:)';
+                            % Assign the input as the zscores of the data
+                            new_testing_input(current_testing_idx, :) = zscore(mixed_speaker_fft);
+                            % Assign the output as the zscores of the data
+                            new_testing_output(current_testing_idx, :) = zscore(target_speaker_fft);
                             % Iterate idx
                             current_testing_idx = current_testing_idx + 1;
                         end
@@ -338,7 +433,7 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                 obj.training_data(obj.dataset_size + 1).data = data;
                 obj.training_data(obj.dataset_size + 1).name = new_speaker_data.name;
                 
-                % Rename data to meet the network training standard
+                % Rename data to meet the network validation standard
                 testing_input_table = array2table(new_testing_input);
                 testing_output_table = array2table(new_testing_output);
                 validation_data = [testing_input_table, testing_output_table];
@@ -347,7 +442,8 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
                 
                 % Iterate dataset size
                 obj.dataset_size = obj.dataset_size + 1;
-            end            
+            end
+            disp('Training and validation data has been caluclated and partioned.');
         end
     end
 end
