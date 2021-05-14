@@ -42,7 +42,7 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
         % Audio vectors is a list of the audio vectors said by the speaker,
         % fs is the sample rate of all the clips (NEEDS TO BE THE SAME),
         % speaker_name is the name of the speaker
-        function addNewSpeaker(obj, audio_vectors, fs, speaker_name)
+        function addNewSpeaker(obj, audio_vectors, speaker_name)
             
             % Check to see if the speaker is already in the system, and if
             % so do nothing. This will need to be addressed later
@@ -59,17 +59,20 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             speech_time = 0;
             
             % Loop through all the audio vectors
-            for v = 1 : length(audio_vectors(:, 1))
+            for v = 1 : length(audio_vectors)
+                
+                % Feedback
+                disp(['Processing audio clip ', num2str(v), ' out of ',...
+                    num2str(length(audio_vectors)), '.']);
                 
                 % Pre-process the audio clip
-                audio = audio_vectors(v, :);
-                [processed_audio, fs] = preProcessAudio(obj, audio, fs);
+                audio = audio_vectors(v).audio;
+                [processed_audio, fs] = preProcessAudio(obj, audio, audio_vectors(v).fs);
             
                 % Break the audio into windows according to window_size
                 windows = makeAudioWindows(obj, processed_audio, fs);
                 
                 % Append the new data to the list
-                processed_audio_all = [processed_audio_all ; processed_audio];
                 windows_all = [windows_all; windows];
                 
                 % Update the amount of speech time
@@ -82,13 +85,8 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             obj.speech_data(obj.speech_data_size + 1).original_audio = audio;
             obj.speech_data(obj.speech_data_size + 1).speech_time = speech_time;
             obj.speech_data(obj.speech_data_size + 1).fs = fs;
-            obj.speech_data(obj.speech_data_size + 1).processed_audio = processed_audio_all;
             obj.speech_data(obj.speech_data_size + 1).windows = windows_all;
-            obj.speech_data_size = obj.speech_data_size + 1;
-            
-            % Parition the data into training and test sets
-            partitionData(obj);
-            
+            obj.speech_data_size = obj.speech_data_size + 1;            
         end
         
         % Begin training the neural networks if enough users exist in the
@@ -102,24 +100,29 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             end
             
             % Define the structure of each neural network
-            numNodes = 4000;
             obj.network_layers = [
                 
-                featureInputLayer((obj.desired_fs / obj.window_size))
+                featureInputLayer((obj.desired_fs / obj.window_size) * 2)
                 
-                fullyConnectedLayer(numNodes)
-                tanhLayer
-                batchNormalizationLayer
+                fullyConnectedLayer(8000, 'BiasL2Factor', 1,...
+                                    'WeightsInitializer', 'narrow-normal',...
+                                    'BiasInitializer', 'narrow-normal')
+                layerNormalizationLayer
+                leakyReluLayer
                 dropoutLayer(0.75)
                 
-                fullyConnectedLayer(numNodes)
-                tanhLayer
-                batchNormalizationLayer
+                fullyConnectedLayer(8000, 'BiasL2Factor', 1,...
+                                    'WeightsInitializer', 'narrow-normal',...
+                                    'BiasInitializer', 'narrow-normal')
+                layerNormalizationLayer
+                leakyReluLayer
                 dropoutLayer(0.75)
                 
-                fullyConnectedLayer((obj.desired_fs / obj.window_size))
+                fullyConnectedLayer((obj.desired_fs / obj.window_size) * 2,...
+                                    'BiasL2Factor', 1,...
+                                    'WeightsInitializer', 'narrow-normal',...
+                                    'BiasInitializer', 'narrow-normal')
                 tanhLayer
-                
                 regressionLayer];
             
             % Train the networks with the given parameters
@@ -128,19 +131,24 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             obj.filter_masks = struct();
             for s = 1 : obj.dataset_size
                 
+                % Skip the librispeech speakers
+                if (contains(obj.training_data(s).name, 'libri'))
+                    continue;
+                end
+                
                 training_options = trainingOptions('adam',...
                     'Plots', 'training-progress',...
-                    'MiniBatchSize', 64,...
+                    'MiniBatchSize', 128,...
                     'Shuffle', 'every-epoch',...
                     'ExecutionEnvironment', 'cpu',...
                     'MaxEpochs', 20,...
                     'ValidationData', obj.testing_data(s).validation_data,...
                     'ValidationFrequency', 50,...
                     'GradientThreshold', 1,...
-                    'InitialLearnRate',0.001,...
+                    'InitialLearnRate',0.1,...
                     'LearnRateSchedule','piecewise',...
-                    'LearnRateDropPeriod',1,...
-                    'LearnRateDropFactor',0.5);
+                    'LearnRateDropPeriod',2,...
+                    'LearnRateDropFactor',0.1);
                 current_net = trainNetwork(obj.training_data(s).data, obj.network_layers, training_options);
                 obj.filter_masks(s).net = current_net;
                 obj.filter_masks(s).speaker = obj.training_data(s).name;
@@ -172,19 +180,182 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             % Prepare the data to be run through the network by creating
             % windows and calculating FFTs
             windows = makeAudioWindows(obj, processed_audio, new_fs);
-            fft_windows = zeros(length(windows(:, 1)), length(windows(1, :)));
+            fft_windows = zeros(length(windows(:, 1)), length(windows(1, :)) * 2);
             output_windows = fft_windows;
+            freq_windows = zeros(length(windows(:, 1)), length(windows(1, :)));
+            time_windows = freq_windows;
             for w = 1 : length(windows(:, 1))
                 temp_fft = fft(windows(w, :));
-                temp_fft = temp_fft(1 : floor(length(temp_fft) / 2));
+                temp_fft = [real(temp_fft); imag(temp_fft)];
+                temp_fft = temp_fft(:)';
                 fft_windows(w, :) = temp_fft;
             end
             
             % Run the ffts through the network
             for w = 1 : length(fft_windows(:, 1))
-                output_windows(w, :) = ifft(net.predict(fft_windows(w, :)));
+                output_windows(w, :) = net.predict(fft_windows(w, :));
+                freq_windows(w, :) = output_windows(w, 1:2:end) + (output_windows(w, 2:2:end) * 1i);
+                time_windows(w, :) = ifft(freq_windows(w, :), 'symmetric');
             end
             
+            
+            % Stitch the vector back together
+            separated_audio = time_windows(:)';
+        end
+        
+        function partitionData(obj)
+            
+            % Ensure there are at least two speakers in the dataset
+            if (obj.speech_data_size < 2)
+                disp('Need more than 1 speaker to begin creating datasets.');
+                return;
+            end
+            
+            disp('Partitioning the data into training and testing sets.');
+            
+            % Loop through all the speaker data and create a global
+            % training pool of overlapping speech. The size of this pool
+            % will grow factorially, so be wary of adding many speakers to
+            % the system.
+            
+            % Erase previous data
+            obj.training_data = struct();
+            obj.testing_data = struct();
+            obj.dataset_size = 0;
+            
+            % Get the original speaker whose speech the other windows will
+            % be added to
+            for new_speaker = 1 : length(obj.speech_data)
+                
+                % Simplifies variable calls
+                new_speaker_data = obj.speech_data(new_speaker);
+                
+                % If the speaker is part of the librispeech dataset, skip
+                % them because no models will be created for them
+                if (contains(new_speaker_data.name, 'libri'))
+                    continue;
+                end
+                
+                % Print what speaker is being calculated
+                disp(['Calculating and partitioning data for ', new_speaker_data.name]);
+
+                % Calculate the index on where to cutoff the training and
+                % testing datasets
+                training_index_cutoff = floor(length(new_speaker_data.windows(:, 1)) * obj.training_percentage);
+                testing_index_cutoff = training_index_cutoff + 1;
+
+                % Create the matrices that will be used for making both training
+                % and testing data sets
+                new_training_data = new_speaker_data(1).windows(1 : training_index_cutoff, :);
+                new_testing_data = new_speaker_data(1).windows(testing_index_cutoff : end - 1, :);
+                
+                % Create empty matrices that will store all of the
+                % overlapping speech. This need to be pre-allocated because
+                % of the volume of data that will be created
+                training_overlapping_windows_amount = 0;
+                testing_overlapping_windows_amount = 0;
+                training_data_windows_amount = length(new_training_data(:, 1));
+                testing_data_windows_amount = length(new_testing_data(:, 1));
+                for other_speaker = 1 : length(obj.speech_data)
+                    
+                    % Don't include this speaker in the calculation
+                    if (new_speaker == other_speaker)
+                        continue;
+                    end
+                    
+                    % Determine how many rows the matrices will have
+                    training_overlapping_windows_amount = training_overlapping_windows_amount + (training_data_windows_amount * length(obj.speech_data(other_speaker).windows(:, 1)));
+                    testing_overlapping_windows_amount = testing_overlapping_windows_amount + (testing_data_windows_amount * length(obj.speech_data(other_speaker).windows(:, 1)));
+                end
+                new_training_input = zeros(training_overlapping_windows_amount, (obj.desired_fs / obj.window_size) * 2);
+                new_testing_input = zeros(testing_overlapping_windows_amount, (obj.desired_fs / obj.window_size) * 2);
+                new_training_output = new_training_input;
+                new_testing_output = new_testing_input;
+                % Loop through the data AGAIN and use the speech from the
+                % OTHER speakers and add it to this speaker. This will
+                % create windows of overlapping speech
+                current_training_idx = 1;
+                current_testing_idx = 1;
+                for other_speaker = 1 : length(obj.speech_data)
+                    
+                    % Don't add overlapping speech from the same speaker
+                    if (new_speaker == other_speaker)
+                        continue;
+                    end
+                    
+                    % Grab the windows from the speaker
+                    other_speaker_speech = obj.speech_data(other_speaker).windows;                    
+                    
+                    % Loop through the current speakers windows
+                    for trd = 1 : training_data_windows_amount
+                        
+                        % Loop through the other speakers windows
+                        for os = 1 : length(other_speaker_speech(:, 1))                                                        
+                            % Add the speech together
+                            overlapping_vector = other_speaker_speech(os, :) + new_training_data(trd, :);
+                            % Compute the FFT for each of the speech vectors
+                            target_speaker_fft = fft(new_training_data(trd, :));
+                            mixed_speaker_fft = fft(overlapping_vector);
+                            % Separate out the real and imaginary parts of
+                            % the fft and use them as separate inputs
+                            target_speaker_fft = [real(target_speaker_fft); imag(target_speaker_fft)];
+                            target_speaker_fft = target_speaker_fft(:)';
+                            mixed_speaker_fft = [real(mixed_speaker_fft); imag(mixed_speaker_fft)];
+                            mixed_speaker_fft = mixed_speaker_fft(:)';
+                            % Assign the input as the zscores of the data
+                            new_training_input(current_training_idx, :) = zscore(mixed_speaker_fft);
+                            % Assign the output as the zscores of the data
+                            new_training_output(current_training_idx, :) = zscore(target_speaker_fft);
+                            % Iterate idx
+                            current_training_idx = current_training_idx + 1;
+                        end
+                    end
+                    
+                    % Repeat the previous process but for the testing data
+                    for ted = 1 : testing_data_windows_amount
+                        
+                        % Loop through the other speakers windows
+                        for ots = 1 : length(other_speaker_speech(:, 1))
+                            
+                            % Add the speech together
+                            overlapping_vector = other_speaker_speech(ots, :) + new_testing_data(ted, :);
+                            % Compute the FFT for each of the speech vectors
+                            target_speaker_fft = fft(new_testing_data(ted, :));
+                            mixed_speaker_fft = fft(overlapping_vector);
+                            % Separate out the real and imaginary parts of
+                            % the fft and use them as separate inputs
+                            target_speaker_fft = [real(target_speaker_fft); imag(target_speaker_fft)];
+                            target_speaker_fft = target_speaker_fft(:)';
+                            mixed_speaker_fft = [real(mixed_speaker_fft); imag(mixed_speaker_fft)];
+                            mixed_speaker_fft = mixed_speaker_fft(:)';
+                            % Assign the input as the zscores of the data
+                            new_testing_input(current_testing_idx, :) = zscore(mixed_speaker_fft);
+                            % Assign the output as the zscores of the data
+                            new_testing_output(current_testing_idx, :) = zscore(target_speaker_fft);
+                            % Iterate idx
+                            current_testing_idx = current_testing_idx + 1;
+                        end
+                    end
+                end
+                
+                % Append the final matrices to their respective structs
+                training_input_table = array2table(new_training_input);
+                training_output_table = array2table(new_training_output);
+                data = [training_input_table, training_output_table];                
+                obj.training_data(obj.dataset_size + 1).data = data;
+                obj.training_data(obj.dataset_size + 1).name = new_speaker_data.name;
+                
+                % Rename data to meet the network validation standard
+                testing_input_table = array2table(new_testing_input);
+                testing_output_table = array2table(new_testing_output);
+                validation_data = [testing_input_table, testing_output_table];
+                obj.testing_data(obj.dataset_size + 1).validation_data = validation_data;
+                obj.testing_data(obj.dataset_size + 1).name = new_speaker_data.name;
+                
+                % Iterate dataset size
+                obj.dataset_size = obj.dataset_size + 1;
+            end
+            disp('Training and validation data has been caluclated and partioned.');
         end
     end
     
@@ -193,8 +364,6 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
         % Apply the audio pre-processing to the specified entry. This
         % function is copied from the SpeechProcessing class.
         function [speech_vector, new_fs, speech_indices, norm_audio] = preProcessAudio(obj, audio, fs)
-            
-            disp('Pre-processing the audio clip(s).');
             
             % Make sure audio is sampled at the correct frequency, and if
             % not resample it
@@ -287,163 +456,6 @@ classdef (ConstructOnLoad) SpeechSeparator < handle
             
             % Resample audio
             resampled_audio = resample(audio, num, denom);
-        end
-        
-        function partitionData(obj)
-            
-            % Ensure there are at least two speakers in the dataset
-            if (obj.speech_data_size < 2)
-                disp('Need more than 1 speaker to begin creating datasets.');
-                return;
-            end
-            
-            disp('Partitioning the data into training and testing sets.');
-            
-            % Loop through all the speaker data and create a global
-            % training pool of overlapping speech. The size of this pool
-            % will grow factorially, so be wary of adding many speakers to
-            % the system.
-            
-            % Erase previous data
-            obj.training_data = struct();
-            obj.testing_data = struct();
-            obj.dataset_size = 0;
-            
-            % Get the original speaker whose speech the other windows will
-            % be added to
-            for new_speaker = 1 : length(obj.speech_data)
-                
-                % Simplifies variable calls
-                new_speaker_data = obj.speech_data(new_speaker);
-                
-                % Print what speaker is being calculated
-                disp(['Calculating and partitioning data for ', new_speaker_data.name]);
-
-                % Calculate the index on where to cutoff the training and
-                % testing datasets
-                training_index_cutoff = floor(length(new_speaker_data.windows(:, 1)) * obj.training_percentage);
-                testing_index_cutoff = training_index_cutoff + 1;
-
-                % Create the matrices that will be used for making both training
-                % and testing data sets
-                new_training_data = new_speaker_data(1).windows(1 : training_index_cutoff, :);
-                new_testing_data = new_speaker_data(1).windows(testing_index_cutoff : end - 1, :);
-                
-                % Create empty matrices that will store all of the
-                % overlapping speech. This need to be pre-allocated because
-                % of the volume of data that will be created
-                training_overlapping_windows_amount = 0;
-                testing_overlapping_windows_amount = 0;
-                training_data_windows_amount = length(new_training_data(:, 1));
-                testing_data_windows_amount = length(new_testing_data(:, 1));
-                for other_speaker = 1 : length(obj.speech_data)
-                    
-                    % Don't include this speaker in the calculation
-                    if (new_speaker == other_speaker)
-                        continue;
-                    end
-                    
-                    % Determine how many rows the matrices will have
-                    training_overlapping_windows_amount = training_overlapping_windows_amount + (training_data_windows_amount * length(obj.speech_data(other_speaker).windows(:, 1)));
-                    testing_overlapping_windows_amount = testing_overlapping_windows_amount + (testing_data_windows_amount * length(obj.speech_data(other_speaker).windows(:, 1)));
-                end
-                new_training_input = zeros(training_overlapping_windows_amount, (obj.desired_fs / obj.window_size));
-                new_testing_input = zeros(testing_overlapping_windows_amount, (obj.desired_fs / obj.window_size));
-                new_training_output = new_training_input;
-                new_testing_output = new_testing_input;
-                % Loop through the data AGAIN and use the speech from the
-                % OTHER speakers and add it to this speaker. This will
-                % create windows of overlapping speech
-                current_training_idx = 1;
-                current_testing_idx = 1;
-                for other_speaker = 1 : length(obj.speech_data)
-                    
-                    % Don't add overlapping speech from the same speaker
-                    if (new_speaker == other_speaker)
-                        continue;
-                    end
-                    
-                    % Grab the windows from the speaker
-                    other_speaker_speech = obj.speech_data(other_speaker).windows;                    
-                    
-                    % Loop through the current speakers windows
-                    for cs = 1 : training_data_windows_amount
-                        
-                        % Loop through the other speakers windows
-                        for os = 1 : length(other_speaker_speech(:, 1))                                                        
-                            % Add the speech together
-                            overlapping_vector = other_speaker_speech(os, :) + new_training_data(cs, :);
-                            % Compute the FFT for each of the speech vectors
-                            target_speaker_fft = fft(new_training_data(cs, :));
-                            mixed_speaker_fft = fft(overlapping_vector);
-                            % Cut out the latter half of the vector since
-                            % its an even func
-                            target_speaker_fft = target_speaker_fft(1 : floor(length(target_speaker_fft) / 2));
-                            mixed_speaker_fft = mixed_speaker_fft(1 : floor(length(mixed_speaker_fft) / 2));
-                            % Separate out the real and imaginary parts of
-                            % the fft and use them as separate inputs
-                            target_speaker_fft = [real(target_speaker_fft); imag(target_speaker_fft)];
-                            target_speaker_fft = target_speaker_fft(:)';
-                            mixed_speaker_fft = [real(mixed_speaker_fft); imag(mixed_speaker_fft)];
-                            mixed_speaker_fft = mixed_speaker_fft(:)';
-                            % Assign the input as the zscores of the data
-                            new_training_input(current_training_idx, :) = zscore(mixed_speaker_fft);
-                            % Assign the output as the zscores of the data
-                            new_training_output(current_training_idx, :) = zscore(target_speaker_fft);
-                            % Iterate idx
-                            current_training_idx = current_training_idx + 1;
-                        end
-                    end
-                    
-                    % Repeat the previous process but for the testing data
-                    for cs = 1 : testing_data_windows_amount
-                        
-                        % Loop through the other speakers windows
-                        for os = 1 : length(other_speaker_speech(:, 1))
-                            
-                            % Add the speech together
-                            overlapping_vector = other_speaker_speech(os, :) + new_testing_data(cs, :);
-                            % Compute the FFT for each of the speech vectors
-                            target_speaker_fft = fft(new_testing_data(cs, :));
-                            mixed_speaker_fft = fft(overlapping_vector);
-                            % Cut out the latter half of the vector since
-                            % its an even func
-                            target_speaker_fft = target_speaker_fft(1 : floor(length(target_speaker_fft) / 2));
-                            mixed_speaker_fft = mixed_speaker_fft(1 : floor(length(mixed_speaker_fft) / 2));
-                            % Separate out the real and imaginary parts of
-                            % the fft and use them as separate inputs
-                            target_speaker_fft = [real(target_speaker_fft); imag(target_speaker_fft)];
-                            target_speaker_fft = target_speaker_fft(:)';
-                            mixed_speaker_fft = [real(mixed_speaker_fft); imag(mixed_speaker_fft)];
-                            mixed_speaker_fft = mixed_speaker_fft(:)';
-                            % Assign the input as the zscores of the data
-                            new_testing_input(current_testing_idx, :) = zscore(mixed_speaker_fft);
-                            % Assign the output as the zscores of the data
-                            new_testing_output(current_testing_idx, :) = zscore(target_speaker_fft);
-                            % Iterate idx
-                            current_testing_idx = current_testing_idx + 1;
-                        end
-                    end
-                end
-                
-                % Append the final matrices to their respective structs
-                training_input_table = array2table(new_training_input);
-                training_output_table = array2table(new_training_output);
-                data = [training_input_table, training_output_table];                
-                obj.training_data(obj.dataset_size + 1).data = data;
-                obj.training_data(obj.dataset_size + 1).name = new_speaker_data.name;
-                
-                % Rename data to meet the network validation standard
-                testing_input_table = array2table(new_testing_input);
-                testing_output_table = array2table(new_testing_output);
-                validation_data = [testing_input_table, testing_output_table];
-                obj.testing_data(obj.dataset_size + 1).validation_data = validation_data;
-                obj.testing_data(obj.dataset_size + 1).name = new_speaker_data.name;
-                
-                % Iterate dataset size
-                obj.dataset_size = obj.dataset_size + 1;
-            end
-            disp('Training and validation data has been caluclated and partioned.');
         end
     end
 end

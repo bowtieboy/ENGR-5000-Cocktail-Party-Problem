@@ -17,4 +17,4 @@ speaker_name = 'Matthew Lima';
 
 %% Get the output of the network
 
-speechSeparator.separateSpeech(audio, fs, speaker_name);
+seperated_speech = speechSeparator.separateSpeech(audio, fs, speaker_name);
